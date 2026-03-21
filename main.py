@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field, field_validator
 import uvicorn
 import logging
 from io import BytesIO
+import asyncio
 
 # Suppress warnings
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -44,6 +45,9 @@ except ImportError as e:
 # Configuration
 OUTPUT_DIR = Path("outputs")
 OUTPUT_DIR.mkdir(exist_ok=True)
+
+# Store active files to prevent premature cleanup
+active_files = set()
 
 # Pydantic models
 class ChapterRequest(BaseModel):
@@ -364,8 +368,18 @@ async def startup_event():
         logger.error(f"Failed to initialize TTS: {e}")
         tts_instance = None
 
+async def delayed_cleanup(file_path: Path, delay_seconds: int = 60):
+    """Clean up file after a delay"""
+    await asyncio.sleep(delay_seconds)
+    try:
+        if file_path.exists():
+            file_path.unlink()
+            logger.info(f"Cleaned up: {file_path}")
+    except Exception as e:
+        logger.error(f"Error cleaning up {file_path}: {e}")
+
 def cleanup_file(file_path: Path):
-    """Clean up temporary files"""
+    """Clean up temporary files immediately"""
     try:
         if file_path.exists():
             file_path.unlink()
@@ -400,7 +414,7 @@ async def get_voices():
         "recommended_for_narration": ["am_adam", "am_michael", "am_leo"]
     }
 
-@app.post("/synthesize/chapter", response_model=TTSResponse)
+@app.post("/synthesize/chapter")
 async def synthesize_chapter(
     chapter: ChapterRequest,
     background_tasks: BackgroundTasks,
@@ -415,6 +429,7 @@ async def synthesize_chapter(
     - **speed**: Speech speed (0.5-2.0, default: 1.0)
     - **add_silence_between_sentences**: Add silence between sentences (default: true)
     - **silence_duration_ms**: Silence duration in milliseconds (default: 100)
+    - **return_audio**: If true, returns the audio file directly instead of JSON
     """
     if not tts_instance:
         raise HTTPException(status_code=503, detail="TTS service not initialized")
@@ -440,10 +455,22 @@ async def synthesize_chapter(
             # Calculate duration
             duration = len(audio) / tts_instance.sample_rate
             
-            # Schedule cleanup
+            # Return audio file directly if requested
+            if return_audio:
+                # Don't cleanup immediately - let the file be served first
+                # Schedule cleanup after 5 minutes instead
+                background_tasks.add_task(delayed_cleanup, output_path, 300)
+                
+                return FileResponse(
+                    path=output_path,
+                    media_type="audio/mpeg",
+                    filename=filename
+                )
+            
+            # Otherwise return JSON response with file info and schedule cleanup
             background_tasks.add_task(cleanup_file, output_path)
             
-            response_data = TTSResponse(
+            return TTSResponse(
                 success=True,
                 file_id=file_id,
                 filename=filename,
@@ -451,17 +478,6 @@ async def synthesize_chapter(
                 sentences=sentence_count,
                 message=f"Chapter processed successfully: {sentence_count} sentences, {duration:.2f} seconds"
             )
-            
-            # Return audio file directly if requested
-            if return_audio:
-                return FileResponse(
-                    path=output_path,
-                    media_type="audio/mpeg",
-                    filename=filename,
-                    background=cleanup_file(output_path)
-                )
-            
-            return response_data
             
         finally:
             # Restore original voice
@@ -471,10 +487,11 @@ async def synthesize_chapter(
         logger.error(f"Chapter synthesis error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/synthesize/book", response_model=Dict[str, Any])
+@app.post("/synthesize/book")
 async def synthesize_book(
     book: BookRequest,
-    background_tasks: BackgroundTasks
+    background_tasks: BackgroundTasks,
+    return_audio: bool = False
 ):
     """
     Convert a complete book with multiple chapters to speech (MP3 format)
@@ -484,6 +501,7 @@ async def synthesize_book(
     - **voice**: Default voice for all chapters
     - **speed**: Default speech speed
     - **add_chapter_markers**: Add audio markers between chapters (default: true)
+    - **return_audio**: If true, returns the audio file directly instead of JSON
     """
     if not tts_instance:
         raise HTTPException(status_code=503, detail="TTS service not initialized")
@@ -501,7 +519,18 @@ async def synthesize_book(
         # Save as MP3
         tts_instance.save_as_mp3(audio, output_path)
         
-        # Schedule cleanup
+        # Return audio file directly if requested
+        if return_audio:
+            # Schedule cleanup after 10 minutes for longer books
+            background_tasks.add_task(delayed_cleanup, output_path, 600)
+            
+            return FileResponse(
+                path=output_path,
+                media_type="audio/mpeg",
+                filename=filename
+            )
+        
+        # Otherwise return JSON response with file info and schedule cleanup
         background_tasks.add_task(cleanup_file, output_path)
         
         return {
@@ -525,7 +554,8 @@ async def synthesize_from_file(
     speed: float = Form(1.0, ge=0.5, le=2.0, description="Speech speed"),
     title: Optional[str] = Form(None, description="Chapter title"),
     add_silence_between_sentences: bool = Form(True, description="Add silence between sentences"),
-    silence_duration_ms: int = Form(100, ge=0, le=1000, description="Silence duration in milliseconds")
+    silence_duration_ms: int = Form(100, ge=0, le=1000, description="Silence duration in milliseconds"),
+    background_tasks: BackgroundTasks = None
 ):
     """
     Convert text from a file to speech (MP3 format)
@@ -569,14 +599,14 @@ async def synthesize_from_file(
             # Save as MP3
             tts_instance.save_as_mp3(audio, output_path)
             
-            # Calculate duration
-            duration = len(audio) / tts_instance.sample_rate
+            # Schedule cleanup after 5 minutes
+            if background_tasks:
+                background_tasks.add_task(delayed_cleanup, output_path, 300)
             
             return FileResponse(
                 path=output_path,
                 media_type="audio/mpeg",
-                filename=f"{file.filename.rsplit('.', 1)[0]}.mp3",
-                background=cleanup_file(output_path)
+                filename=f"{file.filename.rsplit('.', 1)[0]}.mp3"
             )
             
         finally:
@@ -587,7 +617,7 @@ async def synthesize_from_file(
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/download/{file_id}")
-async def download_audio(file_id: str):
+async def download_audio(file_id: str, background_tasks: BackgroundTasks):
     """
     Download generated audio file
     
@@ -597,21 +627,22 @@ async def download_audio(file_id: str):
     for ext in ['mp3', 'wav']:
         file_path = OUTPUT_DIR / f"{file_id}.{ext}"
         if file_path.exists():
+            # Schedule cleanup after download
+            background_tasks.add_task(delayed_cleanup, file_path, 60)
             return FileResponse(
                 path=file_path,
                 media_type=f"audio/{ext}",
-                filename=f"speech.{ext}",
-                background=cleanup_file(file_path)
+                filename=f"speech.{ext}"
             )
     
     # Also check for files with custom names (containing file_id)
     for file_path in OUTPUT_DIR.glob(f"*{file_id}*.mp3"):
         if file_path.exists():
+            background_tasks.add_task(delayed_cleanup, file_path, 60)
             return FileResponse(
                 path=file_path,
                 media_type="audio/mpeg",
-                filename=file_path.name,
-                background=cleanup_file(file_path)
+                filename=file_path.name
             )
     
     raise HTTPException(status_code=404, detail="File not found")
