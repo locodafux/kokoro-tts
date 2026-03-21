@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Kokoro TTS Application - Corrected version with proper tensor handling
+Kokoro TTS Application - Chapter Mode with Sentence Chunking
+Handles long text by splitting into sentences, generating each, then merging
 """
 
 import argparse
@@ -12,6 +13,9 @@ from pathlib import Path
 import subprocess
 import tempfile
 import torch
+import re
+from typing import List, Tuple
+import time
 
 # Suppress warnings
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -27,9 +31,9 @@ except ImportError as e:
 
 
 class KokoroTTS:
-    """Kokoro TTS wrapper class with proper tensor handling"""
+    """Kokoro TTS wrapper class with sentence chunking for long text"""
     
-    def __init__(self, device='cpu', voice='af_bella', repo_id='hexgrad/Kokoro-82M'):
+    def __init__(self, device='cpu', voice='am_adam', repo_id='hexgrad/Kokoro-82M'):
         """
         Initialize the TTS pipeline
         
@@ -62,14 +66,183 @@ class KokoroTTS:
             print(f"Failed to initialize pipeline: {e}")
             raise
     
-    def text_to_speech(self, text, output_file, speed=1.0):
+    def split_into_sentences(self, text: str) -> List[str]:
         """
-        Convert text to speech and save as MP3
+        Split text into sentences using regex patterns
+        
+        Args:
+            text: Input text to split
+            
+        Returns:
+            List of sentences
+        """
+        # Pattern to split sentences (handles common abbreviations)
+        # Matches periods, question marks, exclamation points followed by space and capital letter
+        sentence_pattern = r'(?<=[.!?])\s+(?=[A-Z])'
+        
+        # Split into sentences
+        sentences = re.split(sentence_pattern, text)
+        
+        # Clean up each sentence
+        sentences = [s.strip() for s in sentences if s.strip()]
+        
+        # Merge very short sentences (less than 10 chars) with previous sentence
+        merged_sentences = []
+        for sentence in sentences:
+            if len(sentence) < 10 and merged_sentences:
+                merged_sentences[-1] += " " + sentence
+            else:
+                merged_sentences.append(sentence)
+        
+        return merged_sentences
+    
+    def generate_sentence_audio(self, sentence: str, speed: float = 1.0) -> np.ndarray:
+        """
+        Generate audio for a single sentence
+        
+        Args:
+            sentence: Text to convert
+            speed: Speech speed
+            
+        Returns:
+            numpy array of audio samples
+        """
+        try:
+            audio_chunks = []
+            generator = self.pipeline(
+                sentence,
+                voice=self.voice,
+                speed=speed,
+                split_pattern=r'\n+'
+            )
+            
+            for gs, ps, audio in generator:
+                if audio is not None and len(audio) > 0:
+                    if isinstance(audio, torch.Tensor):
+                        audio = audio.cpu().numpy()
+                    if len(audio.shape) > 1:
+                        audio = audio.squeeze()
+                    audio_chunks.append(audio)
+            
+            if not audio_chunks:
+                return np.array([])
+            
+            return np.concatenate(audio_chunks)
+            
+        except Exception as e:
+            print(f"  ⚠️  Error generating sentence: {e}")
+            return np.array([])
+    
+    def text_to_speech_chunked(self, text: str, output_file: str, speed: float = 1.0, 
+                               show_progress: bool = True) -> str:
+        """
+        Convert long text to speech by splitting into sentences and merging
+        
+        Args:
+            text: Input text (can be very long)
+            output_file: Output file path
+            speed: Speech speed
+            show_progress: Show progress bar/text
+            
+        Returns:
+            Output file path
+        """
+        try:
+            # Validate input
+            if not text or not text.strip():
+                raise ValueError("Empty text provided")
+            
+            # Split into sentences
+            print("\n📝 Splitting text into sentences...")
+            sentences = self.split_into_sentences(text)
+            print(f"✓ Split into {len(sentences)} sentences")
+            
+            # Generate audio for each sentence
+            print("\n🎵 Generating audio for each sentence...")
+            audio_segments = []
+            total_sentences = len(sentences)
+            
+            for i, sentence in enumerate(sentences, 1):
+                if show_progress:
+                    # Show progress
+                    progress = (i / total_sentences) * 100
+                    bar_length = 40
+                    filled = int(bar_length * i // total_sentences)
+                    bar = '█' * filled + '░' * (bar_length - filled)
+                    print(f"\r  [{bar}] {i}/{total_sentences} ({progress:.1f}%) - {sentence[:50]}...", 
+                          end='', flush=True)
+                
+                # Generate audio for this sentence
+                audio = self.generate_sentence_audio(sentence, speed)
+                
+                if len(audio) > 0:
+                    audio_segments.append(audio)
+                
+                # Small delay to prevent overwhelming the system
+                if i % 10 == 0:
+                    time.sleep(0.1)
+            
+            print()  # New line after progress
+            
+            if not audio_segments:
+                raise ValueError("No audio generated for any sentence")
+            
+            # Merge all audio segments
+            print("\n🔊 Merging audio segments...")
+            final_audio = np.concatenate(audio_segments)
+            
+            # Add small pause between sentences? (optional)
+            # Add 0.1 seconds of silence between sentences
+            silence_duration = int(0.1 * self.sample_rate)
+            silence = np.zeros(silence_duration)
+            
+            # Insert silence between segments
+            final_audio_with_pauses = []
+            for i, segment in enumerate(audio_segments):
+                final_audio_with_pauses.append(segment)
+                if i < len(audio_segments) - 1:  # Don't add silence after last segment
+                    final_audio_with_pauses.append(silence)
+            
+            final_audio = np.concatenate(final_audio_with_pauses)
+            
+            # Normalize audio to prevent clipping
+            max_val = np.max(np.abs(final_audio))
+            if max_val > 1.0:
+                final_audio = final_audio / max_val
+            
+            total_duration = len(final_audio) / self.sample_rate
+            print(f"✓ Total audio duration: {total_duration:.2f} seconds ({total_duration/60:.2f} minutes)")
+            
+            # Save output
+            print(f"\n💾 Saving to {output_file}...")
+            output_path = Path(output_file)
+            
+            if output_path.suffix.lower() == '.mp3':
+                self._save_as_mp3(final_audio, output_path)
+            else:
+                sf.write(output_path, final_audio, self.sample_rate)
+                print(f"✓ Saved as WAV: {output_path}")
+            
+            print(f"✓ Successfully saved audio to: {output_path}")
+            return str(output_path)
+            
+        except Exception as e:
+            print(f"\n❌ Error generating speech: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+    
+    def text_to_speech(self, text: str, output_file: str, speed: float = 1.0) -> str:
+        """
+        Convert text to speech (single chunk, for shorter text)
         
         Args:
             text: Input text to convert
             output_file: Output file path
-            speed: Speech speed (0.5 to 2.0)
+            speed: Speech speed
+            
+        Returns:
+            Output file path
         """
         try:
             # Validate input
@@ -83,66 +256,61 @@ class KokoroTTS:
             audio_chunks = []
             
             # Process text through the pipeline
-            try:
-                generator = self.pipeline(
-                    text, 
-                    voice=self.voice, 
-                    speed=speed,
-                    split_pattern=r'\n+'
-                )
-                
-                # Collect audio chunks
-                chunk_count = 0
-                for gs, ps, audio in generator:
-                    if audio is not None and len(audio) > 0:
-                        # Convert tensor to numpy array if needed
-                        if isinstance(audio, torch.Tensor):
-                            audio = audio.cpu().numpy()
-                        
-                        # Ensure it's a 1D array
-                        if len(audio.shape) > 1:
-                            audio = audio.squeeze()
-                        
-                        audio_chunks.append(audio)
-                        chunk_count += 1
-                        print(f"Generated chunk {chunk_count} (samples: {len(audio)})")
-                
-                if not audio_chunks:
-                    raise ValueError("No audio generated - pipeline returned empty result")
-                
-                # Concatenate all audio chunks
-                final_audio = np.concatenate(audio_chunks)
-                
-                # Normalize audio to prevent clipping
-                max_val = np.max(np.abs(final_audio))
-                if max_val > 1.0:
-                    final_audio = final_audio / max_val
-                
-                print(f"Total audio samples: {len(final_audio)}")
-                print(f"Total audio duration: {len(final_audio) / self.sample_rate:.2f} seconds")
-                
-                # Determine output format
-                output_path = Path(output_file)
-                
-                if output_path.suffix.lower() == '.mp3':
-                    # Save as MP3 using ffmpeg
-                    self._save_as_mp3(final_audio, output_path)
-                else:
-                    # Save as WAV
-                    sf.write(output_path, final_audio, self.sample_rate)
-                    print(f"✓ Saved as WAV: {output_path}")
-                
-                print(f"✓ Successfully saved audio to: {output_path}")
-                return str(output_path)
-                
-            except Exception as e:
-                print(f"Error during generation: {e}")
-                import traceback
-                traceback.print_exc()
-                raise
-                
+            generator = self.pipeline(
+                text, 
+                voice=self.voice, 
+                speed=speed,
+                split_pattern=r'\n+'
+            )
+            
+            # Collect audio chunks
+            chunk_count = 0
+            for gs, ps, audio in generator:
+                if audio is not None and len(audio) > 0:
+                    # Convert tensor to numpy array if needed
+                    if isinstance(audio, torch.Tensor):
+                        audio = audio.cpu().numpy()
+                    
+                    # Ensure it's a 1D array
+                    if len(audio.shape) > 1:
+                        audio = audio.squeeze()
+                    
+                    audio_chunks.append(audio)
+                    chunk_count += 1
+                    print(f"Generated chunk {chunk_count} (samples: {len(audio)})")
+            
+            if not audio_chunks:
+                raise ValueError("No audio generated - pipeline returned empty result")
+            
+            # Concatenate all audio chunks
+            final_audio = np.concatenate(audio_chunks)
+            
+            # Normalize audio to prevent clipping
+            max_val = np.max(np.abs(final_audio))
+            if max_val > 1.0:
+                final_audio = final_audio / max_val
+            
+            print(f"Total audio samples: {len(final_audio)}")
+            print(f"Total audio duration: {len(final_audio) / self.sample_rate:.2f} seconds")
+            
+            # Determine output format
+            output_path = Path(output_file)
+            
+            if output_path.suffix.lower() == '.mp3':
+                # Save as MP3 using ffmpeg
+                self._save_as_mp3(final_audio, output_path)
+            else:
+                # Save as WAV
+                sf.write(output_path, final_audio, self.sample_rate)
+                print(f"✓ Saved as WAV: {output_path}")
+            
+            print(f"✓ Successfully saved audio to: {output_path}")
+            return str(output_path)
+            
         except Exception as e:
-            print(f"Error generating speech: {e}", file=sys.stderr)
+            print(f"Error during generation: {e}")
+            import traceback
+            traceback.print_exc()
             raise
     
     def _save_as_mp3(self, audio, output_path):
@@ -172,7 +340,7 @@ class KokoroTTS:
                 ]
                 
                 # Run conversion
-                result = subprocess.run(cmd, capture_output=True, check=True)
+                subprocess.run(cmd, capture_output=True, check=True)
                 print(f"✓ Converted to MP3 using ffmpeg")
                 
             except (subprocess.CalledProcessError, FileNotFoundError) as e:
@@ -203,13 +371,23 @@ class KokoroTTS:
 def main():
     """Main function to run the TTS application"""
     parser = argparse.ArgumentParser(
-        description='Kokoro TTS - Convert text to speech',
+        description='Kokoro TTS - Convert text to speech with chapter/chunking support',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  # Short text (standard mode)
   %(prog)s "Hello world" -o hello.mp3
-  %(prog)s -f input.txt -o output.mp3
-  %(prog)s -i --voice af_nicole --speed 1.2
+  
+  # Long text/chapter (automatic sentence chunking)
+  %(prog)s -f chapter.txt -o audiobook.mp3 --chunk
+  
+  # Use custom voice and speed
+  %(prog)s -f story.txt -o narration.mp3 -v am_adam -s 0.9 --chunk
+  
+  # Interactive mode
+  %(prog)s -i --chunk
+  
+  # List available voices
   %(prog)s --list-voices
         """
     )
@@ -217,12 +395,12 @@ Examples:
     parser.add_argument(
         'text',
         nargs='?',
-        help='Text to convert to speech'
+        help='Text to convert to speech (short text)'
     )
     
     parser.add_argument(
         '-f', '--file',
-        help='Input text file (alternative to providing text directly)'
+        help='Input text file (supports long text/chapters)'
     )
     
     parser.add_argument(
@@ -233,8 +411,8 @@ Examples:
     
     parser.add_argument(
         '-v', '--voice',
-        default='af_bella',
-        help='Voice to use (default: af_bella)'
+        default='am_adam',
+        help='Voice to use (default: am_adam) - best for narration'
     )
     
     parser.add_argument(
@@ -258,9 +436,21 @@ Examples:
     )
     
     parser.add_argument(
+        '--chunk',
+        action='store_true',
+        help='Enable sentence chunking for long text (recommended for chapters/books)'
+    )
+    
+    parser.add_argument(
         '--list-voices',
         action='store_true',
         help='List available voices and exit'
+    )
+    
+    parser.add_argument(
+        '--no-progress',
+        action='store_true',
+        help='Disable progress bar'
     )
     
     args = parser.parse_args()
@@ -268,9 +458,14 @@ Examples:
     # List voices if requested
     if args.list_voices:
         tts = KokoroTTS(device='cpu')
-        print("Available voices:")
+        print("\nAvailable voices:")
+        print("-" * 40)
         for voice in tts.list_voices():
             print(f"  {voice}")
+        print("\nRecommended voices for narration:")
+        print("  • am_adam - Best for professional narration")
+        print("  • am_michael - Friendly, conversational")
+        print("  • am_leo - Youthful, energetic")
         return
     
     # Initialize TTS
@@ -286,8 +481,16 @@ Examples:
         print("Kokoro TTS Interactive Mode")
         print("="*60)
         print(f"Voice: {args.voice} | Speed: {args.speed}x")
-        print("Enter sentences to convert (type 'quit' to exit)")
+        if args.chunk:
+            print("Mode: CHAPTER MODE (sentence chunking enabled)")
+            print("  • Handles long text by splitting into sentences")
+            print("  • Merges all sentences into one audio file")
+        else:
+            print("Mode: STANDARD MODE (best for short text)")
+        print("\nEnter text (type 'quit' to exit, 'mode' to toggle chunking)")
         print("-"*60)
+        
+        chunk_mode = args.chunk
         
         while True:
             try:
@@ -295,12 +498,23 @@ Examples:
                 if text.lower() in ['quit', 'exit', 'q']:
                     print("Goodbye!")
                     break
+                if text.lower() == 'mode':
+                    chunk_mode = not chunk_mode
+                    print(f"✓ Chunking mode: {'ON' if chunk_mode else 'OFF'}")
+                    continue
                 if text:
                     import time
                     timestamp = int(time.time())
                     output_file = f"output_{timestamp}.mp3"
                     try:
-                        tts.text_to_speech(text, output_file, speed=args.speed)
+                        if chunk_mode and len(text) > 200:
+                            # Use chunked mode for longer text
+                            tts.text_to_speech_chunked(
+                                text, output_file, speed=args.speed,
+                                show_progress=not args.no_progress
+                            )
+                        else:
+                            tts.text_to_speech(text, output_file, speed=args.speed)
                         print(f"💾 Saved to: {output_file}")
                     except Exception as e:
                         print(f"❌ Error: {e}")
@@ -315,6 +529,7 @@ Examples:
                 print(f"File not found: {args.file}", file=sys.stderr)
                 sys.exit(1)
             
+            print(f"\n📖 Reading file: {args.file}")
             with open(file_path, 'r', encoding='utf-8') as f:
                 text = f.read().strip()
             
@@ -322,13 +537,38 @@ Examples:
                 print("File is empty", file=sys.stderr)
                 sys.exit(1)
             
-            tts.text_to_speech(text, args.output, speed=args.speed)
+            # Show file statistics
+            word_count = len(text.split())
+            char_count = len(text)
+            print(f"✓ File loaded: {word_count} words, {char_count} characters")
+            
+            # Choose mode based on text length and user preference
+            use_chunking = args.chunk or len(text) > 500  # Auto-enable for long text
+            
+            if use_chunking:
+                print("\n🎯 Using CHAPTER MODE (sentence chunking)")
+                print("   This is recommended for long text to ensure stability")
+                tts.text_to_speech_chunked(
+                    text, args.output, speed=args.speed,
+                    show_progress=not args.no_progress
+                )
+            else:
+                print("\n🎯 Using STANDARD MODE (single chunk)")
+                tts.text_to_speech(text, args.output, speed=args.speed)
+                
         except Exception as e:
             print(f"Error reading file: {e}", file=sys.stderr)
             sys.exit(1)
     
     elif args.text:
-        tts.text_to_speech(args.text, args.output, speed=args.speed)
+        # Use text from command line
+        if args.chunk and len(args.text) > 200:
+            tts.text_to_speech_chunked(
+                args.text, args.output, speed=args.speed,
+                show_progress=not args.no_progress
+            )
+        else:
+            tts.text_to_speech(args.text, args.output, speed=args.speed)
     
     else:
         parser.print_help()
