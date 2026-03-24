@@ -16,7 +16,7 @@ import re
 import time
 import uuid
 import shutil
-from typing import List, Optional, Union, Dict, Any, Tuple
+from typing import List, Optional, Union, Dict, Any, Tuple, AsyncGenerator
 from fastapi import FastAPI, HTTPException, File, UploadFile, Form, BackgroundTasks
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,6 +25,7 @@ import uvicorn
 import logging
 from io import BytesIO
 import asyncio
+import json
 
 # Suppress warnings
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -66,6 +67,31 @@ class ChapterRequest(BaseModel):
             raise ValueError('Chapter content cannot be empty')
         return v.strip()
 
+class StreamingChapterRequest(BaseModel):
+    """Request model for streaming chapter text with chunking options"""
+    title: Optional[str] = Field(None, description="Chapter title")
+    content: str = Field(..., description="Chapter content/text")
+    voice: str = Field("am_adam", description="Voice to use for synthesis")
+    speed: float = Field(1.0, ge=0.5, le=2.0, description="Speech speed (0.5 to 2.0)")
+    chunk_size: str = Field("sentence", description="Chunking strategy: 'sentence', 'paragraph', or 'character'")
+    add_silence_between_chunks: bool = Field(True, description="Add silence between chunks")
+    silence_duration_ms: int = Field(100, ge=0, le=1000, description="Silence duration in milliseconds")
+    stream_metadata: bool = Field(True, description="Include metadata in the stream")
+    
+    @field_validator('content')
+    @classmethod
+    def content_not_empty(cls, v):
+        if not v or not v.strip():
+            raise ValueError('Chapter content cannot be empty')
+        return v.strip()
+    
+    @field_validator('chunk_size')
+    @classmethod
+    def valid_chunk_size(cls, v):
+        if v not in ['sentence', 'paragraph', 'character']:
+            raise ValueError('chunk_size must be one of: sentence, paragraph, character')
+        return v
+
 class BookRequest(BaseModel):
     """Request model for multiple chapters"""
     title: str = Field(..., description="Book title")
@@ -94,6 +120,16 @@ class VoicesResponse(BaseModel):
     voices: List[str]
     default: str = "am_adam"
     recommended_for_narration: List[str] = ["am_adam", "am_michael", "am_leo"]
+
+class StreamingChunk(BaseModel):
+    """Model for streaming chunks"""
+    type: str  # 'audio' or 'metadata'
+    data: Optional[str] = None  # base64 encoded audio for 'audio' type
+    index: Optional[int] = None
+    text: Optional[str] = None
+    duration: Optional[float] = None
+    timestamp: Optional[float] = None
+    is_final: Optional[bool] = False
 
 class KokoroTTS:
     """Kokoro TTS wrapper class with advanced chapter support"""
@@ -140,6 +176,33 @@ class KokoroTTS:
         
         return merged_sentences
     
+    def split_into_paragraphs(self, text: str) -> List[str]:
+        """Split text into paragraphs"""
+        paragraphs = text.split('\n\n')
+        return [p.strip() for p in paragraphs if p.strip()]
+    
+    def split_into_characters(self, text: str, chunk_size: int = 500) -> List[str]:
+        """Split text into character chunks (useful for very long texts)"""
+        chunks = []
+        for i in range(0, len(text), chunk_size):
+            chunk = text[i:i+chunk_size]
+            # Try to break at a sentence boundary if possible
+            if i + chunk_size < len(text):
+                last_period = chunk.rfind('.')
+                last_question = chunk.rfind('?')
+                last_exclamation = chunk.rfind('!')
+                last_boundary = max(last_period, last_question, last_exclamation)
+                if last_boundary > chunk_size // 2:
+                    chunk = text[i:i+last_boundary+1]
+                    chunks.append(chunk.strip())
+                    # Adjust i for next iteration
+                    i += last_boundary - chunk_size
+                    continue
+            
+            chunks.append(chunk.strip())
+        
+        return [c for c in chunks if c]
+    
     def generate_audio_for_text(self, text: str, speed: float = 1.0) -> np.ndarray:
         """Generate audio for a block of text"""
         try:
@@ -167,6 +230,113 @@ class KokoroTTS:
         except Exception as e:
             logger.error(f"Error generating audio: {e}")
             return np.array([])
+    
+    async def generate_audio_stream(self, request: StreamingChapterRequest) -> AsyncGenerator[bytes, None]:
+        """Generate audio as a stream with chunking"""
+        try:
+            # Split content based on chunking strategy
+            if request.chunk_size == 'sentence':
+                chunks = self.split_into_sentences(request.content)
+            elif request.chunk_size == 'paragraph':
+                chunks = self.split_into_paragraphs(request.content)
+            else:  # character
+                chunks = self.split_into_characters(request.content, chunk_size=500)
+            
+            logger.info(f"Streaming {len(chunks)} chunks for chapter '{request.title or 'Untitled'}'")
+            
+            # Store original voice
+            original_voice = self.voice
+            self.voice = request.voice
+            
+            try:
+                total_duration = 0
+                start_time = time.time()
+                
+                # Send metadata first if requested
+                if request.stream_metadata:
+                    metadata = {
+                        "type": "metadata",
+                        "title": request.title,
+                        "total_chunks": len(chunks),
+                        "voice": request.voice,
+                        "speed": request.speed,
+                        "sample_rate": self.sample_rate,
+                        "chunk_size": request.chunk_size,
+                        "timestamp": start_time
+                    }
+                    yield f"data: {json.dumps(metadata)}\n\n".encode('utf-8')
+                
+                # Process each chunk
+                for i, chunk_text in enumerate(chunks, 1):
+                    chunk_start_time = time.time()
+                    
+                    # Generate audio for this chunk
+                    audio = self.generate_audio_for_text(chunk_text, request.speed)
+                    
+                    if len(audio) > 0:
+                        chunk_duration = len(audio) / self.sample_rate
+                        total_duration += chunk_duration
+                        
+                        # Convert audio to base64 for streaming
+                        import base64
+                        audio_bytes = BytesIO()
+                        sf.write(audio_bytes, audio, self.sample_rate, format='WAV')
+                        audio_bytes.seek(0)
+                        audio_base64 = base64.b64encode(audio_bytes.read()).decode('utf-8')
+                        
+                        # Send audio chunk
+                        audio_chunk = {
+                            "type": "audio",
+                            "index": i,
+                            "text": chunk_text[:100] + "..." if len(chunk_text) > 100 else chunk_text,
+                            "duration": chunk_duration,
+                            "audio": audio_base64,
+                            "timestamp": time.time()
+                        }
+                        yield f"data: {json.dumps(audio_chunk)}\n\n".encode('utf-8')
+                        
+                        # Add silence between chunks if requested
+                        if request.add_silence_between_chunks and i < len(chunks):
+                            silence_duration = int((request.silence_duration_ms / 1000.0) * self.sample_rate)
+                            if silence_duration > 0:
+                                silence = np.zeros(silence_duration)
+                                silence_audio = BytesIO()
+                                sf.write(silence_audio, silence, self.sample_rate, format='WAV')
+                                silence_audio.seek(0)
+                                silence_base64 = base64.b64encode(silence_audio.read()).decode('utf-8')
+                                
+                                silence_chunk = {
+                                    "type": "silence",
+                                    "duration_ms": request.silence_duration_ms,
+                                    "audio": silence_base64
+                                }
+                                yield f"data: {json.dumps(silence_chunk)}\n\n".encode('utf-8')
+                    
+                    # Small delay to prevent overwhelming the client
+                    await asyncio.sleep(0.01)
+                
+                # Send completion message
+                completion = {
+                    "type": "complete",
+                    "total_duration": total_duration,
+                    "total_chunks": len(chunks),
+                    "total_time": time.time() - start_time,
+                    "is_final": True
+                }
+                yield f"data: {json.dumps(completion)}\n\n".encode('utf-8')
+                
+            finally:
+                # Restore original voice
+                self.voice = original_voice
+                
+        except Exception as e:
+            logger.error(f"Stream generation error: {e}")
+            error_msg = {
+                "type": "error",
+                "error": str(e),
+                "is_final": True
+            }
+            yield f"data: {json.dumps(error_msg)}\n\n".encode('utf-8')
     
     def generate_chapter_audio(self, chapter: ChapterRequest) -> Tuple[np.ndarray, int]:
         """Generate audio for a complete chapter with sentence chunking"""
@@ -398,6 +568,7 @@ async def root():
         "sample_rate": tts_instance.sample_rate if tts_instance else 0,
         "endpoints": [
             "/synthesize/chapter - Convert a single chapter",
+            "/synthesize/stream - Stream chapter audio in real-time",
             "/synthesize/book - Convert a complete book with multiple chapters",
             "/synthesize/file - Convert from text file",
             "/voices - List available voices",
@@ -486,6 +657,57 @@ async def synthesize_chapter(
     except Exception as e:
         logger.error(f"Chapter synthesis error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/synthesize/stream")
+async def synthesize_stream(
+    request: StreamingChapterRequest
+):
+    """
+    Stream chapter audio in real-time with server-sent events
+    
+    This endpoint streams audio chunks as they're generated, allowing for
+    real-time playback without waiting for the entire synthesis to complete.
+    
+    - **title**: Optional chapter title
+    - **content**: Chapter text content
+    - **voice**: Voice to use (default: am_adam)
+    - **speed**: Speech speed (0.5-2.0, default: 1.0)
+    - **chunk_size**: Chunking strategy - 'sentence', 'paragraph', or 'character'
+    - **add_silence_between_chunks**: Add silence between chunks (default: true)
+    - **silence_duration_ms**: Silence duration in milliseconds (default: 100)
+    - **stream_metadata**: Include metadata in the stream (default: true)
+    
+    Returns a Server-Sent Events (SSE) stream with:
+    - Metadata chunk: Information about the stream
+    - Audio chunks: Base64-encoded WAV audio chunks
+    - Silence chunks: Silence between audio chunks
+    - Complete chunk: Final status with total duration
+    """
+    if not tts_instance:
+        raise HTTPException(status_code=503, detail="TTS service not initialized")
+    
+    async def generate():
+        try:
+            async for chunk in tts_instance.generate_audio_stream(request):
+                yield chunk
+        except Exception as e:
+            logger.error(f"Stream generation error: {e}")
+            error_msg = {
+                "type": "error",
+                "error": str(e),
+                "is_final": True
+            }
+            yield f"data: {json.dumps(error_msg)}\n\n".encode('utf-8')
+    
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"  # Disable nginx buffering
+        }
+    )
 
 @app.post("/synthesize/book")
 async def synthesize_book(
